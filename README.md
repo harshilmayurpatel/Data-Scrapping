@@ -9,7 +9,7 @@ A Python project that scrapes team per-game statistics from [Basketball-Referenc
 
 ## 🚀 Live Demo
 
-**Try it live on Streamlit Community Cloud:** [ ADD YOUR STREAMLIT APP LINK HERE — e.g. https://your-app-name.streamlit.app ]
+**Try it live on Streamlit Community Cloud:** https://data-scrapping-aonbno2rm9z9adkfkvaxwy.streamlit.app/
 
 > No installation needed — pick a league/season in the app and click **Scrape & Analyze** to see it fetch live data, compute stats, and draw the chart in real time.
 
