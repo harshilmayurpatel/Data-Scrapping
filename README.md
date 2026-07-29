@@ -2,9 +2,6 @@
 
 A Python project that scrapes team per-game statistics from [Basketball-Reference.com](https://www.basketball-reference.com/) for four NBA seasons and one WNBA season, runs basic statistical analysis, and generates charts — all packaged into a live, interactive demo.
 
-**Authors:** Madhur Gattani, Harshil Patel, Bevyn Mauru
-**Course/Project:** ITC Final Project
-
 ---
 
 ## 🚀 Live Demo
