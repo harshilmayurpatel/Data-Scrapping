@@ -5,6 +5,8 @@ Purpose: ITC Final Project - Interactive Streamlit Cloud demo
 """
 
 import os
+import time
+from io import StringIO
 import numpy as np
 import pandas as pd
 import requests
@@ -29,8 +31,21 @@ URLS = {
 }
 
 TABLE_IDS = {key: "per_game-team" for key in URLS}
+# Fallback ids the site has used for the team per-game table
+TABLE_ID_FALLBACKS = ["per_game-team", "per_game_team", "team-stats-per_game", "team_stats"]
 GRAPH_TYPES = ["bar", "pie", "line", "scatter", "hist"]
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+# A bare "Mozilla/5.0" is often rejected (403); send normal browser headers
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+# Sports-Reference allows ~20 requests/minute; stay well under it
+REQUEST_GAP_SECONDS = 4
+MAX_RETRIES = 3
 DATA_DIR = "data"
 CHART_DIR = "charts"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -41,37 +56,100 @@ os.makedirs(CHART_DIR, exist_ok=True)
 # Core functions (same logic as the original script, adapted to
 # return values instead of printing, so the UI can display them)
 # ------------------------------------------------------------------
+_SESSION = requests.Session()
+_SESSION.headers.update(HEADERS)
+_last_request_time = 0.0
+
+
+def _polite_get(url):
+    """GET with spacing between requests and retry on rate limits / server errors."""
+    global _last_request_time
+    response = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        wait = REQUEST_GAP_SECONDS - (time.time() - _last_request_time)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            response = _SESSION.get(url, timeout=30)
+        except requests.RequestException as exc:
+            _last_request_time = time.time()
+            if attempt == MAX_RETRIES:
+                return None, f"Network error fetching {url}: {exc}"
+            time.sleep(5 * attempt)
+            continue
+        _last_request_time = time.time()
+
+        if response.status_code == 200:
+            return response, None
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+            retry_after = response.headers.get("Retry-After", "")
+            delay = int(retry_after) if retry_after.isdigit() else 10 * attempt
+            time.sleep(min(delay, 60))
+            continue
+        break
+
+    code = response.status_code if response is not None else "no response"
+    hint = ""
+    if code == 429:
+        hint = " - rate limited by the site; wait a few minutes and try again"
+    elif code == 403:
+        hint = " - the site blocked the request"
+    return None, f"Failed to fetch {url} (status {code}){hint}"
+
+
+def _find_table(html, table_id):
+    """Find the table, including ones the site hides inside HTML comments."""
+    soup = BeautifulSoup(html, "lxml")
+    candidates = [table_id] + [t for t in TABLE_ID_FALLBACKS if t != table_id]
+
+    for tid in candidates:
+        table = soup.find("table", id=tid)
+        if table:
+            return table
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        if "<table" not in comment:
+            continue
+        comment_soup = BeautifulSoup(comment, "lxml")
+        for tid in candidates:
+            table = comment_soup.find("table", id=tid)
+            if table:
+                return table
+    # Last resort: any table whose id looks like a team per-game table
+    for scope in [soup] + [BeautifulSoup(c, "lxml") for c in soup.find_all(string=lambda t: isinstance(t, Comment)) if "<table" in c]:
+        for table in scope.find_all("table", id=True):
+            tid = table["id"].lower()
+            if "per_game" in tid and "team" in tid and "opp" not in tid:
+                return table
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_table(url, table_id):
-    response = requests.get(url, headers=HEADERS, timeout=20)
-    if response.status_code != 200:
-        return None, f"Failed to fetch {url} (status {response.status_code})"
+    response, error = _polite_get(url)
+    if error:
+        return None, error
 
-    soup = BeautifulSoup(response.content, "html.parser")
-    table = soup.find("table", id=table_id)
-
-    if not table:
-        comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-        for comment in comments:
-            if table_id in comment:
-                comment_soup = BeautifulSoup(comment, "html.parser")
-                table = comment_soup.find("table", id=table_id)
-                if table:
-                    break
-
-    if not table:
+    table = _find_table(response.text, table_id)
+    if table is None:
         return None, f"Table '{table_id}' not found in {url}"
 
-    headers_list = [th.text.strip() for th in table.thead.find_all("th") if th.text.strip() != "Rk"]
-    rows = []
-    for row in table.tbody.find_all("tr"):
-        if row.get("class") and "thead" in row["class"]:
-            continue
-        cols = row.find_all("td")
-        stats = [td.text.strip() for td in cols]
-        if len(stats) == len(headers_list):
-            rows.append(stats)
+    df = pd.read_html(StringIO(str(table)))[0]
 
-    df = pd.DataFrame(rows, columns=headers_list)
+    # Flatten multi-row headers if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[-1] for col in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
+
+    df = df.drop(columns=[c for c in df.columns if c == "Rk"], errors="ignore")
+    if "Team" in df.columns:
+        df = df[df["Team"].notna()]
+        df = df[df["Team"] != "Team"]  # repeated header rows
+        df = df[~df["Team"].astype(str).str.contains("League Average", case=False)]
+        df["Team"] = df["Team"].astype(str).str.replace("*", "", regex=False).str.strip()
+    df = df.reset_index(drop=True)
+
+    if df.empty:
+        return None, f"Table found in {url} but it had no team rows"
     return df, f"Scraped {len(df)} rows from {url}"
 
 
